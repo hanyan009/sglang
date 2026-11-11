@@ -146,6 +146,20 @@ class XpuPlatform(Platform):
                 )
                 return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
 
+        if selected_backend == AttentionBackendEnum.SGL_XPU_CUTE:
+            if dtype not in (torch.float16, torch.bfloat16) or head_size != 128:
+                raise ValueError(
+                    "sgl-kernel-xpu CUTE attention requires fp16/bf16 and head_size=128, "
+                    f"got dtype={dtype}, head_size={head_size}."
+                )
+            from sglang.multimodal_gen.runtime.layers.attention.backends.sgl_xpu_cute import (
+                ensure_sgl_xpu_cute_available,
+            )
+
+            ensure_sgl_xpu_cute_available()
+            logger.info("Using sgl-kernel-xpu CUTE attention backend on Intel XPU.")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.sgl_xpu_cute.SglXpuCuteBackend"
+
         if selected_backend == AttentionBackendEnum.TORCH_SDPA:
             logger.info("Using Torch SDPA backend for Intel XPU.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"

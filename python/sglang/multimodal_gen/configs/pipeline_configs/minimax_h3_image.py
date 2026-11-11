@@ -218,8 +218,17 @@ class MiniMaxH3ImagePipelineConfig(MiniMaxH3PipelineConfig):
         if self._server_arg_value(server_args.backend) not in ("auto", "sglang"):
             raise ValueError("MiniMax H3 image requires the native SGLang backend")
         selected_backend = self.resolve_transformer_attention_backend(server_args)
-        if selected_backend not in (None, AttentionBackendEnum.FA):
-            raise ValueError("MiniMax H3 image requires dense FlashAttention")
+        if selected_backend not in (
+            None,
+            AttentionBackendEnum.FA,
+            AttentionBackendEnum.SGL_XPU_CUTE,
+        ):
+            raise ValueError("MiniMax H3 image requires dense FA or XPU CUTE attention")
+        if (
+            selected_backend == AttentionBackendEnum.SGL_XPU_CUTE
+            and server_args.ring_degree > 1
+        ):
+            raise ValueError("MiniMax H3 image ring parallelism requires FA")
         for name in ("nnodes", "dp_size"):
             value = getattr(server_args, name)
             if type(value) is not int or value != 1:
