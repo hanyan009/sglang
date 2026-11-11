@@ -21,17 +21,21 @@ from torch.distributed.tensor import DTensor
 try:
     from sgl_kernel.h3_fused import (
         can_use_h3_indexed_gate,
+        can_use_h3_qk_norm_rope,
         can_use_h3_rmsnorm_indexed_adaln,
         can_use_h3_silu_mul,
         h3_indexed_gate,
+        h3_qk_norm_rope_,
         h3_rmsnorm_indexed_adaln,
         h3_silu_mul,
     )
 except ImportError:
     can_use_h3_indexed_gate = None
+    can_use_h3_qk_norm_rope = None
     can_use_h3_rmsnorm_indexed_adaln = None
     can_use_h3_silu_mul = None
     h3_indexed_gate = None
+    h3_qk_norm_rope_ = None
     h3_rmsnorm_indexed_adaln = None
     h3_silu_mul = None
 
@@ -1558,6 +1562,7 @@ class MiniMaxH3Attention(nn.Module):
         ulysses_active: bool = False,
         ring_active: bool = False,
         x_prequant: tuple[torch.Tensor, torch.Tensor] | None = None,
+        fused_xpu_qk: bool = False,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
 
@@ -1621,6 +1626,7 @@ class MiniMaxH3Attention(nn.Module):
             subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
             ulysses_active=ulysses_active,
             ring_active=ring_active,
+            fused_xpu_qk=fused_xpu_qk,
         )
         out, _ = self.out_proj(out)
         return out
@@ -1639,6 +1645,7 @@ class MiniMaxH3Attention(nn.Module):
         subblock_sparse_query_block_mask: torch.Tensor | None,
         ulysses_active: bool,
         ring_active: bool,
+        fused_xpu_qk: bool,
     ) -> torch.Tensor:
         """q/k/v [T, heads, head_dim] -> attention output [T, heads * head_dim]."""
         total = x.shape[0]
@@ -1652,7 +1659,28 @@ class MiniMaxH3Attention(nn.Module):
             )
         else:
             cos_sin_cache, positions = rope_cache
-            if self._use_fused_qknorm_rope:
+            if (
+                fused_xpu_qk
+                and can_use_h3_qk_norm_rope is not None
+                and can_use_h3_qk_norm_rope(
+                    q,
+                    k,
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    cos_sin_cache,
+                    positions,
+                )
+            ):
+                h3_qk_norm_rope_(
+                    q,
+                    k,
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    cos_sin_cache,
+                    positions,
+                    self.q_norm.eps,
+                )
+            elif self._use_fused_qknorm_rope:
                 if ulysses_active and not ring_active:
                     out = _minimax_h3_qknorm_rope_pipelined_attention(
                         self,
@@ -2020,6 +2048,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
             ulysses_active=ulysses_active,
             ring_active=ring_active,
+            fused_xpu_qk=MINIMAX_H3_NORM_MODULATE.is_enabled(self),
         )
         x = _modulate_gate(
             residual,
