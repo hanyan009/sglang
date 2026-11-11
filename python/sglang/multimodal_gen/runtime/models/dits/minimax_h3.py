@@ -18,6 +18,15 @@ import torch
 from torch import nn
 from torch.distributed.tensor import DTensor
 
+try:
+    from sgl_kernel.h3_fused import (
+        can_use_h3_rmsnorm_indexed_adaln,
+        h3_rmsnorm_indexed_adaln,
+    )
+except ImportError:
+    can_use_h3_rmsnorm_indexed_adaln = None
+    h3_rmsnorm_indexed_adaln = None
+
 from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding,
     silu_and_mul_with_activation_rounding_,
@@ -433,9 +442,19 @@ def _modulate_rmsnorm_scale_shift(
     """RMSNorm + indexed AdaLN.
 
     The reference chain rounds after the norm and after every modulation op.
-    ``fused`` (quality lossless / high) runs one fp32 pass with one rounding,
-    which moves the denoising trajectory at rounding level.
+    On XPU, the H3 kernel retains the eager BF16 materialization boundaries.
+    Other backends retain their existing fused paths.
     """
+    if (
+        fused
+        and x.device.type == "xpu"
+        and x.dtype == dtype == _BF16_DTYPE
+        and norm.weight is not None
+        and can_use_h3_rmsnorm_indexed_adaln is not None
+        and can_use_h3_rmsnorm_indexed_adaln(x, norm.weight, shift, scale, indices)
+    ):
+        eps = norm.eps if norm.eps is not None else torch.finfo(x.dtype).eps
+        return h3_rmsnorm_indexed_adaln(x, norm.weight, shift, scale, indices, eps)
     if (
         fused
         and x.dtype == dtype == _BF16_DTYPE

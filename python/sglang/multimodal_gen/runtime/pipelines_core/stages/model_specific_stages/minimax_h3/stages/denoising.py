@@ -950,6 +950,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
     def _run_image_loop(self, batch: Req, plan: Any, server_args: ServerArgs) -> None:
         """Run the image loop over the published latent and reference rows."""
+        self._maybe_toggle_quality_fusions(batch)
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
             MINIMAX_H3_DENOISE_STATE_EXTRA_KEY,
             MINIMAX_H3_REFERENCE_IMAGE_ROWS_EXTRA_KEY,
