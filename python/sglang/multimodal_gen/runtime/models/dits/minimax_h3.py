@@ -22,14 +22,18 @@ try:
     from sgl_kernel.h3_fused import (
         can_use_h3_indexed_gate,
         can_use_h3_rmsnorm_indexed_adaln,
+        can_use_h3_silu_mul,
         h3_indexed_gate,
         h3_rmsnorm_indexed_adaln,
+        h3_silu_mul,
     )
 except ImportError:
     can_use_h3_indexed_gate = None
     can_use_h3_rmsnorm_indexed_adaln = None
+    can_use_h3_silu_mul = None
     h3_indexed_gate = None
     h3_rmsnorm_indexed_adaln = None
+    h3_silu_mul = None
 
 from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding,
@@ -546,7 +550,11 @@ def _modulate_gate(
     return (x + gate.index_select(0, indices) * other).to(dtype)
 
 
-def _silu_mul(hidden: torch.Tensor, *, reuse_input: bool) -> torch.Tensor:
+def _silu_mul(
+    hidden: torch.Tensor, *, reuse_input: bool, fused_xpu: bool = False
+) -> torch.Tensor:
+    if fused_xpu and can_use_h3_silu_mul is not None and can_use_h3_silu_mul(hidden):
+        return h3_silu_mul(hidden)
     if (
         hidden.is_cuda
         and hidden.dtype == _BF16_DTYPE
@@ -1743,13 +1751,17 @@ class MiniMaxH3MLP(nn.Module):
             quant_config.get_name() == "gguf"
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *, fused_xpu_silu: bool = False) -> torch.Tensor:
         if not isinstance(x, tuple) and x.device.type == "mps":
             out = torch.empty_like(x)
             for start in range(0, x.shape[0], _MPS_MLP_TOKEN_CHUNK_SIZE):
                 stop = min(start + _MPS_MLP_TOKEN_CHUNK_SIZE, x.shape[0])
                 hidden, _ = self.fc1(x[start:stop])
-                hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
+                hidden = _silu_mul(
+                    hidden,
+                    reuse_input=self.reuse_fc1_activation,
+                    fused_xpu=fused_xpu_silu,
+                )
                 chunk, _ = self.fc2(hidden)
                 out[start:stop].copy_(chunk)
                 del hidden, chunk
@@ -1760,7 +1772,11 @@ class MiniMaxH3MLP(nn.Module):
         if _accepts_mxfp8_input(self.fc2) and can_use_silu_mul_mxfp8(hidden):
             out, _ = self.fc2(silu_mul_mxfp8(hidden))
             return out
-        hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
+        hidden = _silu_mul(
+            hidden,
+            reuse_input=self.reuse_fc1_activation,
+            fused_xpu=fused_xpu_silu,
+        )
         out, _ = self.fc2(hidden)
         return out
 
@@ -2022,12 +2038,17 @@ class MiniMaxH3DiTBlock(nn.Module):
                 _, h_fp8, h_scales = indexed_scale_shift_mxfp8_(
                     h, shift_mlp, scale_mlp, combined_indices, keep_bf16=False
                 )
-                h = self.mlp((h_fp8, h_scales))
+                h = self.mlp(
+                    (h_fp8, h_scales),
+                    fused_xpu_silu=MINIMAX_H3_NORM_MODULATE.is_enabled(self),
+                )
             else:
                 h = _modulate_scale_shift(
                     h, shift_mlp, scale_mlp, combined_indices, dtype=_BF16_DTYPE
                 )
-                h = self.mlp(h)
+                h = self.mlp(
+                    h, fused_xpu_silu=MINIMAX_H3_NORM_MODULATE.is_enabled(self)
+                )
         else:
             h = _modulate_rmsnorm_scale_shift(
                 x,
@@ -2038,7 +2059,7 @@ class MiniMaxH3DiTBlock(nn.Module):
                 dtype=_BF16_DTYPE,
                 fused=MINIMAX_H3_NORM_MODULATE.is_enabled(self),
             )
-            h = self.mlp(h)
+            h = self.mlp(h, fused_xpu_silu=MINIMAX_H3_NORM_MODULATE.is_enabled(self))
         # `residual` is block-local here (see above), so this stays in-place
         # even while Cache-DiT is attached.
         return _modulate_gate(
