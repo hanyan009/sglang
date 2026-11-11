@@ -20,11 +20,15 @@ from torch.distributed.tensor import DTensor
 
 try:
     from sgl_kernel.h3_fused import (
+        can_use_h3_indexed_gate,
         can_use_h3_rmsnorm_indexed_adaln,
+        h3_indexed_gate,
         h3_rmsnorm_indexed_adaln,
     )
 except ImportError:
+    can_use_h3_indexed_gate = None
     can_use_h3_rmsnorm_indexed_adaln = None
+    h3_indexed_gate = None
     h3_rmsnorm_indexed_adaln = None
 
 from sglang.kernels.ops.activation.activation import (
@@ -510,9 +514,18 @@ def _modulate_gate(
     *,
     dtype: torch.dtype,
     allow_inplace: bool = True,
+    fused: bool = False,
 ) -> torch.Tensor:
     """Apply an indexed gated residual, optionally reusing the input buffer."""
     # Apply the per-index gated residual: x + gate[idx] * other.
+    if (
+        fused
+        and x.device.type == "xpu"
+        and dtype == _BF16_DTYPE
+        and can_use_h3_indexed_gate is not None
+        and can_use_h3_indexed_gate(x, gate, other, indices)
+    ):
+        return h3_indexed_gate(x, gate, other, indices, inplace=allow_inplace)
     if (
         x.is_cuda
         and x.dtype == _BF16_DTYPE
@@ -1999,6 +2012,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             combined_indices,
             dtype=_BF16_DTYPE,
             allow_inplace=not self.preserve_input_for_cache_dit,
+            fused=MINIMAX_H3_NORM_MODULATE.is_enabled(self),
         )
 
         residual = x
@@ -2033,6 +2047,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             h,
             combined_indices,
             dtype=_BF16_DTYPE,
+            fused=MINIMAX_H3_NORM_MODULATE.is_enabled(self),
         )
 
 
